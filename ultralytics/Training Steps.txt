@@ -1,0 +1,333 @@
+1.Add Partial Convolution to YOLOv8
+      1）Create a new file ultralytics/nn/pconv.py and copy the code into it.
+        import torch
+        import torch.nn as nn
+
+class PartialConv2d(nn.Conv2d):
+    def __init__(self, *args, **kwargs):
+        super(PartialConv2d, self).__init__(*args, **kwargs)
+        
+        self.register_buffer('mask', None)
+        self.output_mask = None
+miaoxue
+        
+    def forward(self, input, mask=None):
+        if mask is not None:
+            self.mask = mask
+            self.output_mask = self.conv2d_forward(torch.ones_like(input), self.mask)
+        else:
+            self.output_mask = None
+            
+        features = super(PartialConv2d, self).forward(input)
+        
+        if self.output_mask is not None:
+            features = features / (self.output_mask + 1e-8)
+            
+        return features, self.output_mask
+
+            2）Add from ultralytics.nn.Pconv import Pconv in ultralytics/nn/tasks.py.
+             
+
+
+2. Add CAFM to YOLOv8
+	1）Add the CAFM code to ultralytics/ultralytics/nn/modules.py and D:\software\Anaconda\Anaconda\envs\pytorch\Lib\site-packages\ultralytics\nn\modules.py.
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+  class CAFM(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super(CAFM, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+    2）Add CAFM in ultralytics/nn/tasks.py.
+    3）Modify the name in ultralytics/ultralytics/models/v8/yolov8.yaml.
+
+
+
+
+
+
+3 Add Hierarchical Feature Fusion Neck to YOLOv8
+     1）Create a new file ultralytics/nn/HFFN.py and copy the code into it.
+
+    import torch
+    import torch.nn as nn
+
+class HFFN(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(HFFN, self).__init__()     # Define Feature Pyramid Network (FPN)
+        self.fpn = nn.ModuleList([ nn.Conv2d(in_channels[i], out_channels, 1, 1, 0, bias=False) for i in range(len(in_channels)) ])
+        
+           self.conv = nn.Conv2d(out_channels * 4, out_channels, 1, 1, 0, bias=False)
+        
+    def forward(self, features):  # Feature Pyramid Network (FPN)
+        fpn_features = [self.fpn[i](features[i]) for i in range(len(features))] #Feature Fusion
+        
+        fused_features = torch.cat(fpn_features, dim=1)
+        fused_features = self.conv(fused_features)
+        
+        return fused_features
+
+     2）In ultralytics/nn/tasks.py, add from ultralytics.nn.HFFN import Pconv.Add it in the def parse_model function.
+
+     3）Add Pconv convolution between the backbone and the neck.
+
+     # The output of the backbone network.
+class CSPDarknet(nn.Module):
+    def __init__(self, ch=32, act=nn.ReLU()):
+        super(CSPDarknet, self).__init__()
+        self.channels = [ch, 2*ch, 4*ch, 8*ch] #Define the network structure, including multiple ResBlocks and CSP layers.        
+    def forward(self, x):  #During the forward pass, output feature maps at different levels.
+        features = []        return features
+
+ # Insert the Pconv layer.
+class CSPDarknet(nn.Module):
+    def __init__(self, ch=32, act=nn.ReLU()):
+        super(CSPDarknet, self).__init__()
+        self.channels = [ch, 2*ch, 4*ch, 8*ch]#Define the network structure, including multiple ResBlocks and CSP layers. 
+        self.pconv = PartialConv2d(in_channels=self.channels[-1], out_channels=self.channels[-1], kernel_size=3, stride=1, padding=1, bias=False)
+        
+    def forward(self, x): #During the forward pass, output feature maps at different levels.
+        features = []
+        # Insert the Pconv layer at the output of the backbone network.
+        pconv_features, _ = self.pconv(features[-1])
+        features[-1] = pconv_features
+        return features
+
+ # Adjust the input of the neck network.
+class HFFN(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(HFFN, self).__init__()  # Define the Feature Pyramid Network (FPN)
+
+        self.fpn = nn.ModuleList([
+            nn.Conv2d(in_channels[i], out_channels, 1, 1, 0, bias=False) for i in range(len(in_channels))
+        ])     #Define the Feature Fusion Layer.
+        self.conv = nn.Conv2d(out_channels * 4, out_channels, 1, 1, 0, bias=False)
+        
+    def forward(self, features):
+        # Feature Pyramid Network (FPN)
+        fpn_features = [self.fpn[i](features[i]) for i in range(len(features))]
+        
+        #Feature Fusion
+        fused_features = torch.cat(fpn_features, dim=1)
+        fused_features = self.conv(fused_features)
+        
+        return fused_features
+
+class YOLOv8(nn.Module):
+    def __init__(self, num_classes=80):
+        super(YOLOv8, self).__init__()
+        # Backbone network
+        self.backbone = CSPDarknet()
+        
+        # Neck network (HFFN)
+        self.neck = HFFN(in_channels=self.backbone.channels, out_channels=512)
+        
+        # Detection head
+        self.head = nn.Conv2d(512, num_classes, 1, 1, 0, bias=False)
+
+    def forward(self, x):
+        # Backbone network outputs multi-level feature maps
+        features = self.backbone(x)
+        
+        # Neck network fuses the features
+        fused_features = self.neck(features)
+        
+        # Detection head outputs predictions
+        predictions = self.head(fused_features)
+        
+        return predictions
+
+
+
+4Modify parameters in ultralytics/yolo/cfg/default.yaml and add parameters in detection_train.py.
+
+
+    
+5 Modify the loss function from CIoU to Inner-MPDioU
+      1)In YOLOv8, the bbox_iou function in the file ultralytics/yolo/utils/metrics.py by default uses CIoU, and the code also includes GIoU and DIoU.To use a different IoU variant, simply set the corresponding parameter to True.
+      import torch
+      import torch.nn as nn
+      import math
+      def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, SIoU=False, EIoU=False, InnerMPDioU=False, Focal=False, alpha=1, gamma=0.5, eps=1e-7):
+    #Calculate the IoU (Intersection over Union) between two bounding boxes and its variants.
+     
+      Args:
+     box1 (Tensor): The first bounding box, in the format (x1, y1, x2, y2) or (x, y, w, h)
+     box2 (Tensor): The second bounding box, in the same format as box1
+     xywh (bool): Whether to use the (x, y, w, h) format, default is True
+     GIoU (bool): Whether to calculate GIoU
+     DIoU (bool): Whether to calculate DIoU
+     CIoU (bool): Whether to calculate CIoU
+     SIoU (bool): Whether to calculate SIoU
+     EIoU (bool): Whether to calculate EIoU
+     InnerMPDioU (bool): Whether to calculate Inner-MPDIoU
+     Focal (bool): Whether to use Focal loss
+     alpha (float): The alpha parameter in Focal loss, default is 1
+     gamma (float): The gamma parameter in Focal loss, default is 0.5
+     eps (float): A small value to prevent division by zero, default is 1e-7
+    Returns:
+    Tensor: The calculated IoU loss
+    # Convert the bounding box to the (x1, y1, x2, y2) format
+    if xywh:
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+        w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
+        b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
+        b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        w1, h1 = b1_x2 - b1_x1, (b1_y2 - b1_y1).clamp(eps)
+        w2, h2 = b2_x2 - b2_x1, (b2_y2 - b2_y1).clamp(eps)
+
+    # Calculate the intersection area
+    inter_x1 = torch.maximum(b1_x1, b2_x1)
+    inter_y1 = torch.maximum(b1_y1, b2_y1)
+    inter_x2 = torch.minimum(b1_x2, b2_x2)
+    inter_y2 = torch.minimum(b1_y2, b2_y2)
+    inter_w = torch.clamp(inter_x2 - inter_x1, min=0)
+    inter_h = torch.clamp(inter_y2 - inter_y1, min=0)
+    inter_area = inter_w * inter_h
+
+    # Calculate the union area
+    area1 = w1 * h1
+    area2 = w2 * h2
+    union_area = area1 + area2 - inter_area + eps
+
+    #  CalculateIoU
+    iou = inter_area / union_area
+
+    if GIoU:
+        #  Calculate GIoU
+        cw = torch.maximum(b1_x2, b2_x2) - torch.minimum(b1_x1, b2_x1)
+        ch = torch.maximum(b1_y2, b2_y2) - torch.minimum(b1_y1, b2_y1)
+        convex_area = cw * ch + eps
+        giou = iou - (convex_area - union_area) / convex_area
+        return giou
+
+    if DIoU or CIoU or EIoU or SIoU:
+        #  Calculate DIoU、CIoU、EIoU、SIoU
+        cw = torch.maximum(b1_x2, b2_x2) - torch.minimum(b1_x1, b2_x1)
+        ch = torch.maximum(b1_y2, b2_y2) - torch.minimum(b1_y1, b2_y1)
+        c2 = cw ** 2 + ch ** 2 + eps
+        rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4 + eps
+
+        if CIoU:
+            #  Calculate CIoU
+            v = (4 / (math.pi ** 2)) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)) ** 2
+            with torch.no_grad():
+                alpha_ciou = v / (v - iou + (1 + eps))
+            if Focal:
+                loss = iou - (rho2 / c2 + torch.pow(v * alpha_ciou + eps, alpha))
+                focal_weight = torch.pow(iou, gamma)
+                return loss * focal_weight
+            else:
+                return iou - (rho2 / c2 + torch.pow(v * alpha_ciou + eps, alpha))
+        elif EIoU:
+            # Calculate EIoU
+            rho_w2 = ((b2_x2 - b2_x1) - (b1_x2 - b1_x1)) ** 2
+            rho_h2 = ((b2_y2 - b2_y1) - (b1_y2 - b1_y1)) ** 2
+            cw2 = cw ** 2 + eps
+            ch2 = ch ** 2 + eps
+            if Focal:
+                loss = iou - (rho2 / c2 + rho_w2 / cw2 + rho_h2 / ch2)
+                focal_weight = torch.pow(iou, gamma)
+                return loss * focal_weight
+            else:
+                return iou - (rho2 / c2 + rho_w2 / cw2 + rho_h2 / ch2)
+        elif SIoU:
+            #  Calculate SIoU
+            s_cw = (b2_x1 + b2_x2 - b1_x1 - b1_x2) * 0.5 + eps
+            s_ch = (b2_y1 + b2_y2 - b1_y1 - b1_y2) * 0.5 + eps
+            sigma = torch.sqrt(s_cw ** 2 + s_ch ** 2)
+            sin_alpha_1 = torch.abs(s_cw) / sigma
+            sin_alpha_2 = torch.abs(s_ch) / sigma
+            threshold = math.sqrt(2) / 2
+            sin_alpha = torch.where(sin_alpha_1 > threshold, sin_alpha_2, sin_alpha_1)
+            angle_cost = torch.cos(torch.arcsin(sin_alpha) * 2 - math.pi / 2)
+            rho_x = (s_cw / cw) ** 2
+            rho_y = (s_ch / ch) ** 2
+            gamma = angle_cost - 2
+            distance_cost = 2 - torch.exp(gamma * rho_x) - torch.exp(gamma * rho_y)
+            omiga_w = torch.abs(w1 - w2) / torch.maximum(w1, w2)
+            omiga_h = torch.abs(h1 - h2) / torch.maximum(h1, h2)
+            shape_cost = torch.pow(1 - torch.exp(-1 * omiga_w), 4) + torch.pow(1 - torch.exp(-1 * omiga_h), 4)
+            if Focal:
+                loss = iou - torch.pow(0.5 * (distance_cost + shape_cost) + eps, alpha)
+                focal_weight = torch.pow(iou, gamma)
+                return loss * focal_weight
+            else:
+                return iou - torch.pow(0.5 * (distance_cost + shape_cost) + eps, alpha)
+        else:
+            #  Calculate DIoU
+            if Focal:
+                loss = iou - rho2 / c2
+                focal_weight = torch.pow(iou, gamma)
+                return loss * focal_weight
+            else:
+                return iou - rho2 / c2
+
+    if InnerMPDioU:
+        # Calculate Inner-MPDIoU
+        #Calculate the center points of the predicted box and the target box
+        pred_cx = (b1_x1 + b1_x2) / 2
+        pred_cy = (b1_y1 + b1_y2) / 2
+        target_cx = (b2_x1 + b2_x2) / 2
+        target_cy = (b2_y1 + b2_y2) / 2
+        
+        # Calculate the distance between the center points
+        center_dist = torch.sqrt((pred_cx - target_cx) ** 2 + (pred_cy - target_cy) ** 2)
+        
+        # Calculate the width and height of the predicted box and the target box
+        pred_w = b1_x2 - b1_x1
+        pred_h = b1_y2 - b1_y1
+        target_w = b2_x2 - b2_x1
+        target_h = b2_y2 - b2_y1
+        
+        # Calculate the difference in width and height
+        w_diff = torch.abs(pred_w - target_w)
+        h_diff = torch.abs(pred_h - target_h)
+        
+        #  Calculate Inner-MPDIoU
+        mpdiou = (center_dist + w_diff + h_diff) / (target_w + target_h + eps)
+        
+        if Focal:
+            loss = torch.log(mpdiou + eps)
+            focal_weight = torch.pow(iou, gamma)
+            return loss * focal_weight
+        else:
+            return torch.log(mpdiou + eps)
+
+    return iou
+
+	
+        2)Modify the forward function in the BboxLoss class in ultralytics/yolo/utils/loss.py and replace the code with
+
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        if type(iou) is tuple:
+            loss_iou = ((1.0 - iou[0]) * iou[1].detach() * weight).sum() / target_scores_sum
+        else:
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+           The final modification of the parameter can be done directly in the call to bbox_iou. For example, the code above uses CIoU, and if Focal_Inner-MPDIoU is used, it can be modified as follows:
+
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, Inner-MPDIoU=True, Focal=True)
+
+         3)In YoloV8, the bbox_iou function is also used in the label assignment rules, specifically in the get_box_metrics function of the TaskAlignedAssigner class in ultralytics/yolo/utils/tal.py: Modify Inner-MPDIoU=True."
+
+
+6. The head part of YoloV8 is in the Detect class in ultralytics/nn/modules.py.
+
